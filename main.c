@@ -358,7 +358,7 @@ static void figura_escalada(const u8 *img, int sw, int sh, int x0, int y0, int d
 }
 
 /* ------------------------------------------------ relevo: malha de polígonos */
-#define ALC 20                    /* alcance da visão, em células */
+#define ALC 12                    /* alcance da visão, em células */
 #define NV (2 * ALC + 1)
 #define ZPERTO 96                 /* plano de corte próximo (8.8) */
 #define ZLONGE (ALC * 256)
