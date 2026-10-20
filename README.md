@@ -39,4 +39,4 @@ As figuras ficam em `imagens/` (PNG). Troque qualquer uma por outra feita por vo
 `make teste` compila uma versão que gera imagens de várias telas, sem precisar do emulador.
 
 ## OBS
-- Esse "Port" é apenas um teste, não planejo fazer um jogo completo, porém, irei atualizar aos poucos para deixar o jogo mais polido.
+- Esse Demake é apenas um teste, não planejo fazer um jogo completo, porém, irei atualizar aos poucos para deixar o jogo mais polido.
