@@ -67,48 +67,27 @@ __attribute__((used)) static const char marca_sram[] = "SRAM_V113";
 #define LARG 120
 #define ALT_T 80
 #define HORIZ 40
-#define PROF 24          /* fatias de profundidade do relevo */
 #define PERTO_3D 10      /* até esta distância, casas e entradas viram 3D */
 #define JAN 64           /* lado da janela de células na memória */
-#define MAX_OBJ 40
 #define SEMENTE 7331
 #define NIVEL_AGUA 31
 #define LIM_ROCHA 58
 #define LIM_NEVE 72
-#define ESCALA_V 28
 
-#define R_AGUA 0
-#define R_GRAMA 3
-#define R_CASA 9
-#define R_TELHADO 10
-#define R_PEDRA 11
-#define R_TIJOLO_A 12
-#define R_TIJOLO_B 13
-#define R_CHAO 14
-#define R_TETO 15
-#define COR_RAMPA(r, l) (64 + (r) * 12 + (l))
+#define COR_RAMPA(r, l) (64 + (r) * NIV + (l))
 
 #define ABS(x) ((x) < 0 ? -(x) : (x))
 
 /* ---------------------------------------------------------------- memória */
 static u8 fb[ALT_T][LARG] __attribute__((aligned(4)));
-static s16 ys[PROF + 1][LARG];
-static u8 cc[PROF + 1][LARG];
 static s32 zbuf[LARG];
 
 static u8 c_alt[JAN * JAN] DADOS_EWRAM;
 static u8 c_tipo[JAN * JAN] DADOS_EWRAM;
 static u8 c_obj[JAN * JAN] DADOS_EWRAM;
-static u8 c_marca[JAN * JAN] DADOS_EWRAM;
-
-typedef struct { s16 z, col, y; u8 tipo; } Objeto;
-static Objeto objs[MAX_OBJ];
-static int nobj;
 
 static s16 sen_t[256];
 static s16 camx_t[LARG];
-static u8 nevoa_t[PROF + 1];
-static s32 mul_t[PROF + 1];
 
 #define SEN(a) sen_t[(a) & 255]
 #define COS(a) sen_t[((a) + 64) & 255]
@@ -180,10 +159,20 @@ static Estrutura *estrutura_bloco(s32 bx, s32 by) {
     int sel = h & 3;
     eb.tipo = 0;
     if (sel < 2) {
-        eb.cx = bx * 32 + 8 + ((h >> 4) & 15);
-        eb.cy = by * 32 + 8 + ((h >> 9) & 15);
+        eb.cx = bx * 32 + 12 + ((h >> 4) & 7);
+        eb.cy = by * 32 + 12 + ((h >> 9) & 7);
         eb.base = altura_bruta(eb.cx, eb.cy);
-        if (eb.base >= NIVEL_AGUA + 3 && eb.base < LIM_ROCHA) eb.tipo = (sel == 0) ? 1 : 2;
+        if (eb.base >= NIVEL_AGUA + 3 && eb.base < LIM_ROCHA) {
+            /* só constrói onde o terreno ao redor é relativamente plano */
+            static const s8 ox[8] = {12, -12, 0, 0, 12, -12, 12, -12};
+            static const s8 oy[8] = {0, 0, 12, -12, 12, 12, -12, -12};
+            int plano = 1;
+            for (int k = 0; k < 8; k++) {
+                int d = altura_bruta(eb.cx + ox[k], eb.cy + oy[k]) - eb.base;
+                if (d > 20 || d < -20) plano = 0;
+            }
+            if (plano) eb.tipo = (sel == 0) ? 1 : 2;
+        }
     }
     return &eb;
 }
@@ -191,7 +180,6 @@ static Estrutura *estrutura_bloco(s32 bx, s32 by) {
 /* tipos de célula: 0 água, 1 areia, 2 grama, 3 rocha, 4 neve
  * objetos: 1 árvore, 2 aldeia, 3 entrada, 4 parede de casa, 5 telhado,
  *          6 pedra da entrada, 7 água (bloqueia) */
-static const u8 rampa_tipo[5] = {0, 1, 3, 5, 7};
 
 static void gerar_celula(s32 wx, s32 wy) {
     int i = ((wy & 63) << 6) | (wx & 63);
@@ -202,10 +190,13 @@ static void gerar_celula(s32 wx, s32 wy) {
     if (e->tipo) {
         dx = wx - e->cx;
         dy = wy - e->cy;
-        int raio = (e->tipo == 1) ? 6 : 3;
-        if (ABS(dx) <= raio && ABS(dy) <= raio) {
+        int raio = (e->tipo == 1) ? 5 : 3;
+        int d = ABS(dx) > ABS(dy) ? ABS(dx) : ABS(dy);
+        if (d <= raio) {
             a = e->base;
             dentro = 1;
+        } else if (d < 12) {          /* rampa suave até o terreno natural */
+            a = e->base + ((a - e->base) * (d - raio)) / (12 - raio);
         }
     }
     if (a < NIVEL_AGUA) { a = NIVEL_AGUA; tipo = 0; obj = 7; }
@@ -225,8 +216,7 @@ static void gerar_celula(s32 wx, s32 wy) {
             if (dx == 0 && dy == 0) obj = 2;
         } else {
             tipo = 3;
-            if (dx == 0 && dy == 0) obj = 3;
-            else if (ABS(dx) <= 1 && ABS(dy) <= 1 && !(dx == 0 && dy == 1)) obj = 6;
+            if (ABS(dx) <= 1 && dy >= -1 && dy <= 0) obj = (dx == 0 && dy == 0) ? 3 : 6;
         }
     } else if (tipo == 2 && (hash2(wx * 3 + 5, wy * 7 + 9) & 15) == 0) {
         obj = 1;
@@ -367,126 +357,407 @@ static void figura_escalada(const u8 *img, int sw, int sh, int x0, int y0, int d
     }
 }
 
-/* ------------------------------------------------------ relevo (mundo 3D) */
-/*
- * Amostra a altura do terreno em ponto fixo 8.8, interpolando entre as
- * quatro células vizinhas. A malha lógica continua em células inteiras para
- * colisões/estruturas, mas a superfície visual deixa de formar degraus largos.
- */
-static s32 altura_interpolada(u32 xu, u32 yu) {
-    s32 wx = (s32)xu, wy = (s32)yu;
-    s32 cx = wx >> 16, cy = wy >> 16;
-    int fx = (int)((xu >> 8) & 255), fy = (int)((yu >> 8) & 255);
-    int i00 = idx_cel(cx, cy);
-    int i10 = idx_cel(cx + 1, cy);
-    int i01 = idx_cel(cx, cy + 1);
-    int i11 = idx_cel(cx + 1, cy + 1);
-    s32 h00 = (s32)c_alt[i00] << 8;
-    s32 h10 = (s32)c_alt[i10] << 8;
-    s32 h01 = (s32)c_alt[i01] << 8;
-    s32 h11 = (s32)c_alt[i11] << 8;
-    s32 a = h00 + (((h10 - h00) * fx) >> 8);
-    s32 b = h01 + (((h11 - h01) * fx) >> 8);
-    return a + (((b - a) * fy) >> 8);
+/* ------------------------------------------------ relevo: malha de polígonos */
+#define ALC 28                    /* alcance da visão, em células */
+#define NV (2 * ALC + 1)
+#define ZPERTO 96                 /* plano de corte próximo (8.8) */
+#define ZLONGE (ALC * 256)
+#define NB 160
+#define MAXIT 1800
+#define FOCO_H 80
+#define FOCO_V 28
+
+typedef struct { s32 x, y, z; } Pt;
+typedef int64_t s64;
+
+static s32 g_camh, g_rx, g_ry, g_c, g_s, g_pcx, g_pcy;
+static int g_i_atual, g_j_atual;
+static s16 v_z[NV * NV] DADOS_EWRAM;
+static s16 v_x[NV * NV] DADOS_EWRAM;
+static s16 p_x[NV * NV] DADOS_EWRAM;
+static s16 p_y[NV * NV] DADOS_EWRAM;
+static u8 p_ok[NV * NV] DADOS_EWRAM;
+static u8 it_k[MAXIT] DADOS_EWRAM;
+static s8 it_i[MAXIT] DADOS_EWRAM;
+static s8 it_j[MAXIT] DADOS_EWRAM;
+static u16 it_chave[MAXIT] DADOS_EWRAM;
+static u16 it_ordem[MAXIT] DADOS_EWRAM;
+static u16 it_cont[2 * NB + 2] DADOS_EWRAM;
+static int n_it;
+static s16 lim_e[ALT_T], lim_d[ALT_T];
+#ifdef TESTE_PC
+static long cont_pix, cont_poly, cont_it, cont_tri;
+#endif
+
+static const u8 R_BASE[5][4] = {
+    {R_AGUA, R_AGUA, R_AGUA, R_AGUA},
+    {R_AREIA, R_AREIA, R_AREIA + 1, R_AREIA + 2},
+    {R_GRAMA, R_GRAMA + 1, R_GRAMA + 2, R_GRAMA + 3},
+    {R_ROCHA, R_ROCHA + 1, R_ROCHA + 2, R_ROCHA + 3},
+    {R_NEVE, R_NEVE, R_NEVE + 1, R_NEVE + 2}};
+
+static void cam_ponto(s32 X8, s32 Y8, s32 H8, Pt *p) {
+    s32 dx = X8 - g_rx, dy = Y8 - g_ry;
+    p->z = (dx * g_c + dy * g_s) >> 8;
+    p->x = (dy * g_c - dx * g_s) >> 8;
+    p->y = g_camh - H8;
 }
 
-static void desenhar_objeto(const Objeto *o) {
+static int nivel_nevoa(s32 z) {
+    s32 l = ((z - 3 * 256) * (NIV - 1)) / (ZLONGE - 3 * 256);
+    return l < 0 ? 0 : (l > NIV - 1 ? NIV - 1 : (int)l);
+}
+
+/* preenche um polígono convexo já em coordenadas de tela */
+FUNC_IWRAM static void poligono_tela(const s32 *px, const s32 *py, int n, u8 cor) {
+    int ymin = 32767, ymax = -32768, i, y;
+    s32 xmin = 32767, xmax = -32768;
+    for (i = 0; i < n; i++) {
+        if (py[i] < ymin) ymin = py[i];
+        if (py[i] > ymax) ymax = py[i];
+        if (px[i] < xmin) xmin = px[i];
+        if (px[i] > xmax) xmax = px[i];
+    }
+    if (ymax < 0 || ymin >= ALT_T || xmax < 0 || xmin >= LARG) return;
+    if (ymin < 0) ymin = 0;
+    if (ymax >= ALT_T) ymax = ALT_T - 1;
+    for (y = ymin; y <= ymax; y++) { lim_e[y] = 32767; lim_d[y] = -32768; }
+    for (i = 0; i < n; i++) {
+        s32 x0 = px[i], y0 = py[i];
+        int b = (i + 1 == n) ? 0 : i + 1;
+        s32 x1 = px[b], y1 = py[b];
+        if (y0 == y1) {
+            if (y0 >= 0 && y0 < ALT_T) {
+                s32 lo = x0 < x1 ? x0 : x1, hi = x0 < x1 ? x1 : x0;
+                if (lo < lim_e[y0]) lim_e[y0] = (s16)lo;
+                if (hi > lim_d[y0]) lim_d[y0] = (s16)hi;
+            }
+            continue;
+        }
+        if (y0 > y1) { s32 t = x0; x0 = x1; x1 = t; t = y0; y0 = y1; y1 = t; }
+        if (y1 < 0 || y0 >= ALT_T) continue;
+        s32 passo = ((x1 - x0) * 65536) / (y1 - y0);
+        int ya = y0 < 0 ? 0 : (int)y0, yb = y1 >= ALT_T ? ALT_T - 1 : (int)y1;
+        s64 x = ((s64)x0 * 65536) + (s64)passo * (ya - y0);
+        for (y = ya; y <= yb; y++, x += passo) {
+            s32 xi = (s32)(x >> 16);
+            if (xi < lim_e[y]) lim_e[y] = (s16)xi;
+            if (xi > lim_d[y]) lim_d[y] = (s16)xi;
+        }
+    }
+    for (y = ymin; y <= ymax; y++) {
+        int l = lim_e[y], r = lim_d[y];
+        if (l > r) continue;
+        if (l < 0) l = 0;
+        if (r >= LARG) r = LARG - 1;
+        if (l > r) continue;
+        memset(&fb[y][l], cor, (size_t)(r - l + 1));
+#ifdef TESTE_PC
+        cont_pix += r - l + 1;
+#endif
+    }
+#ifdef TESTE_PC
+    cont_poly++;
+#endif
+}
+
+/* polígono em coordenadas da câmera: corta no plano próximo e projeta */
+static void poligono_cam(const Pt *in, int n, u8 cor) {
+    Pt out[10];
+    int m = 0, a;
+    s32 sx[10], sy[10];
+    for (a = 0; a < n; a++) {
+        const Pt *P = &in[a], *Q = &in[(a + 1 == n) ? 0 : a + 1];
+        int pin = P->z >= ZPERTO, qin = Q->z >= ZPERTO;
+        if (pin) out[m++] = *P;
+        if (pin != qin) {
+            s32 t = ZPERTO - P->z, d = Q->z - P->z;
+            out[m].x = P->x + ((Q->x - P->x) * t) / d;
+            out[m].y = P->y + ((Q->y - P->y) * t) / d;
+            out[m].z = ZPERTO;
+            m++;
+        }
+    }
+    if (m < 3) return;
+    for (a = 0; a < m; a++) {
+        sx[a] = LARG / 2 + (out[a].x * FOCO_H) / out[a].z;
+        sy[a] = HORIZ + (out[a].y * FOCO_V) / out[a].z;
+    }
+    poligono_tela(sx, sy, m, cor);
+}
+
+static void proj_vert(int g, int cel) {
+    s32 z = v_z[g];
+    p_x[g] = (s16)(LARG / 2 + (v_x[g] * FOCO_H) / z);
+    p_y[g] = (s16)(HORIZ + ((g_camh - c_alt[cel] * 256) * FOCO_V) / z);
+    p_ok[g] = 1;
+}
+
+static void tri_malha(const int *g, const int *cel, const int *h, int a, int b, int c, int par) {
+    static const s8 kx[4] = {0, 1, 0, 1}, ky[4] = {0, 0, 1, 1};
+    int dxb = kx[b] - kx[a], dyb = ky[b] - ky[a], dxc = kx[c] - kx[a], dyc = ky[c] - ky[a];
+    int D = dxb * dyc - dxc * dyb;
+    int hb = h[b] - h[a], hc = h[c] - h[a];
+    int fx = (hb * dyc - hc * dyb) * D, fy = (hc * dxb - hb * dxc) * D;
+    int s = 3 * fx + 3 * fy + 12;
+    int luz = s >= 19 ? 0 : (s >= 10 ? 1 : (s >= 1 ? 2 : 3));
+    {   /* variação leve de brilho, para o terreno não ficar chapado */
+        u32 hv = hash2(g_pcx * 64 + g_i_atual * 3 + a, g_pcy * 64 + g_j_atual * 5 + b + c * 7);
+        if ((hv & 7) == 0 && luz < 3) luz++;
+        else if ((hv & 7) == 1 && luz > 0) luz--;
+    }
+    int topo = a;
+    if (h[b] > h[topo]) topo = b;
+    if (h[c] > h[topo]) topo = c;
+    int tipo = c_tipo[cel[topo]];
+    int ga = g[a], gb = g[b], gc = g[c];
+    int zm = (v_z[ga] + v_z[gb] + v_z[gc]) / 3;
+    int ramp = tipo == 0 ? R_AGUA + (par & 1) : R_BASE[tipo][luz];
+    u8 cor = (u8)COR_RAMPA(ramp, nivel_nevoa(zm));
+#ifdef TESTE_PC
+    cont_tri++;
+#endif
+    if (v_z[ga] >= ZPERTO && v_z[gb] >= ZPERTO && v_z[gc] >= ZPERTO) {
+        if (!p_ok[ga]) proj_vert(ga, cel[a]);
+        if (!p_ok[gb]) proj_vert(gb, cel[b]);
+        if (!p_ok[gc]) proj_vert(gc, cel[c]);
+        s32 sx[3] = {p_x[ga], p_x[gb], p_x[gc]}, sy[3] = {p_y[ga], p_y[gb], p_y[gc]};
+        poligono_tela(sx, sy, 3, cor);
+    } else {
+        Pt p[3];
+        p[0].x = v_x[ga]; p[0].z = v_z[ga]; p[0].y = g_camh - h[a] * 256;
+        p[1].x = v_x[gb]; p[1].z = v_z[gb]; p[1].y = g_camh - h[b] * 256;
+        p[2].x = v_x[gc]; p[2].z = v_z[gc]; p[2].y = g_camh - h[c] * 256;
+        poligono_cam(p, 3, cor);
+    }
+}
+
+static void celula_malha(int i, int j) {
+    int g[4], cel[4], h[4], k;
+    s32 wx = g_pcx + i, wy = g_pcy + j;
+    g[0] = (j + ALC) * NV + (i + ALC);
+    g[1] = g[0] + 1;
+    g[2] = g[0] + NV;
+    g[3] = g[2] + 1;
+    cel[0] = idx_cel(wx, wy);
+    cel[1] = idx_cel(wx + 1, wy);
+    cel[2] = idx_cel(wx, wy + 1);
+    cel[3] = idx_cel(wx + 1, wy + 1);
+    for (k = 0; k < 4; k++) h[k] = c_alt[cel[k]];
+    int par = (int)((wx + wy) & 1);
+    g_i_atual = i;
+    g_j_atual = j;
+    if (par == 0) {
+        tri_malha(g, cel, h, 0, 1, 3, par);
+        tri_malha(g, cel, h, 0, 3, 2, par + 1);
+    } else {
+        tri_malha(g, cel, h, 0, 1, 2, par);
+        tri_malha(g, cel, h, 1, 3, 2, par + 1);
+    }
+}
+
+/* figuras 2D no mundo: 1 árvore, 2 aldeia (de longe), 3 entrada de masmorra (de longe) */
+static void item_figura(int i, int j, int tipo) {
+    int g = (j + ALC) * NV + (i + ALC);
+    s32 z = (v_z[g] + v_z[g + NV + 1]) >> 1, x = (v_x[g] + v_x[g + NV + 1]) >> 1;
+    if (z < ZPERTO) return;
+    s32 wx = g_pcx + i, wy = g_pcy + j;
+    s32 hh = (c_alt[idx_cel(wx, wy)] + c_alt[idx_cel(wx + 1, wy + 1)]) * 128;
+    int sx = LARG / 2 + (int)((x * FOCO_H) / z);
+    int sy = HORIZ + (int)(((g_camh - hh) * FOCO_V) / z);
+    int esc = (5 * 65536) / z;
     const u8 *img;
     int sw, sh;
-    if (o->tipo == 1) { img = FIG_ARVORE; sw = ARVORE_L; sh = ARVORE_A; }
-    else if (o->tipo == 2) { img = FIG_ALDEIA; sw = ALDEIA_L; sh = ALDEIA_A; }
+    if (tipo == 1) { img = FIG_ARVORE; sw = ARVORE_L; sh = ARVORE_A; }
+    else if (tipo == 2) { img = FIG_ALDEIA; sw = ALDEIA_L; sh = ALDEIA_A; }
     else { img = FIG_MASMORRA; sw = MASMORRA_L; sh = MASMORRA_A; }
-    int esc = (5 * 256) / o->z;
     int dw = (sw * esc) >> 8, dh = (sh * esc) >> 8;
     if (dw < 1) dw = 1;
     if (dh < 1) dh = 1;
-    figura_escalada(img, sw, sh, o->col - dw / 2, o->y - dh, dw, dh, 0, 0);
+    figura_escalada(img, sw, sh, sx - dw / 2, sy - dh, dw, dh, 0, 0);
+}
+
+static void parede(const Pt *a, const Pt *b, const Pt *c, const Pt *d, u8 cor) {
+    Pt q[4];
+    q[0] = *a; q[1] = *b; q[2] = *c; q[3] = *d;
+    poligono_cam(q, 4, cor);
+}
+
+/* casa 3D de uma aldeia: paredes e telhado em pirâmide */
+static void desenhar_casa(int i, int j) {
+    s32 hx = g_pcx + i, hy = g_pcy + j;
+    int h0 = c_alt[idx_cel(hx, hy)], k;
+    s32 X0 = (hx - 1) * 256, X1 = (hx + 2) * 256, Y0 = (hy - 1) * 256, Y1 = (hy + 2) * 256;
+    s32 xs[4] = {X0, X1, X1, X0}, ysx[4] = {Y0, Y0, Y1, Y1};
+    Pt b[4], t[4], ap;
+    for (k = 0; k < 4; k++) {
+        cam_ponto(xs[k], ysx[k], h0 * 256, &b[k]);
+        cam_ponto(xs[k], ysx[k], (h0 + 4) * 256, &t[k]);
+    }
+    cam_ponto((X0 + X1) / 2, (Y0 + Y1) / 2, (h0 + 7) * 256, &ap);
+    int L = nivel_nevoa((b[0].z + b[2].z) / 2);
+    if (g_ry < Y0) parede(&b[0], &b[1], &t[1], &t[0], (u8)COR_RAMPA(R_CASA, L));
+    if (g_rx > X1) parede(&b[1], &b[2], &t[2], &t[1], (u8)COR_RAMPA(R_CASA + 1, L));
+    if (g_ry > Y1) {
+        parede(&b[2], &b[3], &t[3], &t[2], (u8)COR_RAMPA(R_CASA + 1, L));
+        Pt d0, d1, d2, d3;
+        cam_ponto(X0 + 300, Y1, h0 * 256, &d0);
+        cam_ponto(X0 + 470, Y1, h0 * 256, &d1);
+        cam_ponto(X0 + 470, Y1, h0 * 256 + 620, &d2);
+        cam_ponto(X0 + 300, Y1, h0 * 256 + 620, &d3);
+        parede(&d0, &d1, &d2, &d3, COR_PORTA);
+    }
+    if (g_rx < X0) parede(&b[3], &b[0], &t[0], &t[3], (u8)COR_RAMPA(R_CASA, L));
+    /* telhado: quatro triângulos, do mais longe para o mais perto */
+    int ordem[4] = {0, 1, 2, 3}, zt[4], a2, b2;
+    for (k = 0; k < 4; k++) zt[k] = (t[k].z + t[(k + 1) & 3].z + ap.z) / 3;
+    for (a2 = 1; a2 < 4; a2++)
+        for (b2 = a2; b2 > 0 && zt[ordem[b2 - 1]] < zt[ordem[b2]]; b2--) {
+            int tmp = ordem[b2]; ordem[b2] = ordem[b2 - 1]; ordem[b2 - 1] = tmp;
+        }
+    for (k = 0; k < 4; k++) {
+        int e = ordem[k];
+        Pt q[3];
+        q[0] = t[e]; q[1] = t[(e + 1) & 3]; q[2] = ap;
+        poligono_cam(q, 3, (u8)COR_RAMPA(R_TELHADO + ((e == 0 || e == 3) ? 0 : 1), L));
+    }
+}
+
+/* bloco de pedra da entrada da masmorra, com a porta virada para o sul */
+static void desenhar_bloco(int i, int j) {
+    s32 cx = g_pcx + i, cy = g_pcy + j;
+    int h0 = c_alt[idx_cel(cx, cy)], k;
+    s32 X0 = (cx - 1) * 256, X1 = (cx + 2) * 256, Y0 = (cy - 1) * 256, Y1 = (cy + 1) * 256;
+    s32 xs[4] = {X0, X1, X1, X0}, ysx[4] = {Y0, Y0, Y1, Y1};
+    Pt b[4], t[4];
+    for (k = 0; k < 4; k++) {
+        cam_ponto(xs[k], ysx[k], h0 * 256, &b[k]);
+        cam_ponto(xs[k], ysx[k], (h0 + 5) * 256, &t[k]);
+    }
+    int L = nivel_nevoa((b[0].z + b[2].z) / 2);
+    if (g_ry < Y0) parede(&b[0], &b[1], &t[1], &t[0], (u8)COR_RAMPA(R_PEDRA, L));
+    if (g_rx > X1) parede(&b[1], &b[2], &t[2], &t[1], (u8)COR_RAMPA(R_PEDRA + 1, L));
+    if (g_ry > Y1) {
+        parede(&b[2], &b[3], &t[3], &t[2], (u8)COR_RAMPA(R_PEDRA + 1, L));
+        Pt d0, d1, d2, d3;
+        cam_ponto(cx * 256 + 128 - 160, Y1, h0 * 256, &d0);
+        cam_ponto(cx * 256 + 128 + 160, Y1, h0 * 256, &d1);
+        cam_ponto(cx * 256 + 128 + 160, Y1, h0 * 256 + 3 * 256, &d2);
+        cam_ponto(cx * 256 + 128 - 160, Y1, h0 * 256 + 3 * 256, &d3);
+        parede(&d0, &d1, &d2, &d3, COR_ENTRADA);
+    }
+    if (g_rx < X0) parede(&b[3], &b[0], &t[0], &t[3], (u8)COR_RAMPA(R_PEDRA, L));
+    if (g_camh > (h0 + 5) * 256) parede(&t[0], &t[1], &t[2], &t[3], (u8)COR_RAMPA(R_PEDRA, L));
+}
+
+static void add_item(int k, int i, int j, int z) {
+    if (n_it >= MAXIT) return;
+    int b = z >> 6;
+    if (b < 0) b = 0;
+    if (b >= NB) b = NB - 1;
+    it_k[n_it] = (u8)k;
+    it_i[n_it] = (s8)i;
+    it_j[n_it] = (s8)j;
+    it_chave[n_it] = (u16)((b << 1) | (k != 0));
+    n_it++;
+}
+
+static int z_canto(int i, int j) {
+    if (i < -ALC) i = -ALC;
+    if (i > ALC) i = ALC;
+    if (j < -ALC) j = -ALC;
+    if (j > ALC) j = ALC;
+    return v_z[(j + ALC) * NV + (i + ALC)];
+}
+
+static void desenhar_item(int n) {
+    int k = it_k[n], i = it_i[n], j = it_j[n];
+    switch (k) {
+    case 0: celula_malha(i, j); break;
+    case 1: item_figura(i, j, 1); break;
+    case 2: item_figura(i, j, c_obj[idx_cel(g_pcx + i, g_pcy + j)] == 2 ? 2 : 3); break;
+    case 3: desenhar_casa(i, j); break;
+    default: desenhar_bloco(i, j); break;
+    }
 }
 
 FUNC_IWRAM static void desenhar_relevo(s32 px, s32 py, int ang, s32 camh) {
-    int z, col, y;
+    int i, j, y, n;
     for (y = 0; y < HORIZ; y++) memset(fb[y], COR_CEU0 + (y * COR_CEU_N) / HORIZ, LARG);
-    for (; y < ALT_T; y++) memset(fb[y], COR_RAMPA(R_GRAMA, 11), LARG);
-    memset(c_marca, 0, sizeof c_marca);
-    nobj = 0;
-    s32 c = COS(ang), s = SEN(ang);
+    for (; y < ALT_T; y++) memset(fb[y], COR_CEU9, LARG);
+    g_camh = camh;
+    g_c = COS(ang);
+    g_s = SEN(ang);
+    g_rx = px >> 8;
+    g_ry = py >> 8;
+    g_pcx = px >> 16;
+    g_pcy = py >> 16;
+    s32 fxp = g_rx & 255, fyp = g_ry & 255;
+    s32 Z0 = (-(fxp * g_c) - fyp * g_s) >> 8, X0 = (fxp * g_s - fyp * g_c) >> 8;
 
-    /* passo 1: projeta o relevo, da fatia mais longe para a mais perto */
-    for (z = PROF; z >= 2; z--) {
-        int L = nevoa_t[z];
-        s32 mul = mul_t[z], d3 = z * 3;
-        u32 x = (u32)(px + z * c * 256 + d3 * s * 64);
-        u32 yy = (u32)(py + z * s * 256 - d3 * c * 64);
-        s32 sx = -(d3 * s * 128) / LARG, sy = (d3 * c * 128) / LARG;
-        for (col = 0; col < LARG; col++, x += (u32)sx, yy += (u32)sy) {
-            s32 wx = (s32)x, wy = (s32)yy;
-            s32 cx = wx >> 16, cy = wy >> 16;
-            int i = (int)((((yy >> 16) & 63) << 6) | ((x >> 16) & 63));
-            int f = c_obj[i], ramp, tone = L;
-            s32 hfix = altura_interpolada(x, yy);
-            if (z <= PERTO_3D && f >= 4 && f <= 6) {
-                /* Casas e pedras ganham volume 3D apenas quando estão perto. */
-                hfix = (s32)c_alt[i] << 8;
-                if (f == 4) { hfix += 4 * 256; ramp = R_CASA; }
-                else if (f == 5) { hfix += 7 * 256; ramp = R_TELHADO; }
-                else { hfix += 6 * 256; ramp = R_PEDRA; }
-            } else {
-                /* Biomas seguem a altura interpolada, sem bordas em blocos. */
-                int ah = (int)(hfix >> 8), t;
-                /* Preserva o piso de praças e o solo rochoso de masmorras,
-                 * que são regiões planas definidas pela lógica das estruturas. */
-                if (c_tipo[i] == 1 && c_alt[i] >= NIVEL_AGUA + 3 && c_alt[i] < LIM_ROCHA) t = 1;
-                else if (c_tipo[i] == 3 && c_alt[i] >= NIVEL_AGUA + 3 && c_alt[i] < LIM_ROCHA) t = 3;
-                else if (ah < NIVEL_AGUA ||
-                         (c_tipo[i] == 0 && hfix <= ((NIVEL_AGUA + 1) << 8))) t = 0;
-                else if (ah < NIVEL_AGUA + 3) t = 1;
-                else if (ah < LIM_ROCHA) t = 2;
-                else if (ah < LIM_NEVE) t = 3;
-                else t = 4;
-                ramp = rampa_tipo[t];
+    /* posição de cada vértice da malha na câmera (somas incrementais) */
+    for (j = 0; j < NV; j++) {
+        s32 zb = Z0 + (j - ALC) * g_s - ALC * g_c, xb = X0 + (j - ALC) * g_c + ALC * g_s;
+        s16 *pz = &v_z[j * NV], *pxx = &v_x[j * NV];
+        for (i = 0; i < NV; i++) {
+            pz[i] = (s16)zb;
+            pxx[i] = (s16)xb;
+            zb += g_c;
+            xb -= g_s;
+        }
+    }
+    memset(p_ok, 0, sizeof p_ok);
 
-                /* Iluminação direcional aproximada pelas inclinações locais. */
-                int gx = (int)c_alt[idx_cel(cx + 1, cy)] - (int)c_alt[idx_cel(cx - 1, cy)];
-                int gy = (int)c_alt[idx_cel(cx, cy + 1)] - (int)c_alt[idx_cel(cx, cy - 1)];
-                int shade = (gx - gy) / 8;
-                if (shade < -1) shade = -1;
-                if (shade > 1) shade = 1;
-                /* Contraste discreto: conserva a paleta e evita faixas duras. */
-                tone += (t == 0) ? 0 : shade;
-                if (tone < 0) tone = 0;
-                if (tone > 11) tone = 11;
+    /* escolhe o que desenhar */
+    n_it = 0;
+    for (j = -ALC; j < ALC; j++) {
+        for (i = -ALC; i < ALC; i++) {
+            int g = (j + ALC) * NV + (i + ALC);
+            int z00 = v_z[g], z10 = v_z[g + 1], z01 = v_z[g + NV], z11 = v_z[g + NV + 1];
+            int zmx = z00, zmn = z00;
+            if (z10 > zmx) zmx = z10; else if (z10 < zmn) zmn = z10;
+            if (z01 > zmx) zmx = z01; else if (z01 < zmn) zmn = z01;
+            if (z11 > zmx) zmx = z11; else if (z11 < zmn) zmn = z11;
+            int zav = (z00 + z10 + z01 + z11) >> 2;
+            int f = c_obj[idx_cel(g_pcx + i, g_pcy + j)];
+            if ((f == 5 || f == 3) && zav <= PERTO_3D * 256 && zav > -3 * 256) {
+                int zc;
+                if (f == 5) {
+                    zc = z_canto(i - 1, j - 1);
+                    if (z_canto(i + 2, j - 1) < zc) zc = z_canto(i + 2, j - 1);
+                    if (z_canto(i - 1, j + 2) < zc) zc = z_canto(i - 1, j + 2);
+                    if (z_canto(i + 2, j + 2) < zc) zc = z_canto(i + 2, j + 2);
+                } else {
+                    zc = z_canto(i - 1, j - 1);
+                    if (z_canto(i + 2, j - 1) < zc) zc = z_canto(i + 2, j - 1);
+                    if (z_canto(i - 1, j + 1) < zc) zc = z_canto(i - 1, j + 1);
+                    if (z_canto(i + 2, j + 1) < zc) zc = z_canto(i + 2, j + 1);
+                }
+                add_item(f == 5 ? 3 : 4, i, j, zc);
             }
-            int cor = COR_RAMPA(ramp, tone);
-            if (z <= PERTO_3D && f == 3) cor = COR_ENTRADA;
-            int yp = HORIZ + (int)(((camh - hfix) * mul) >> 16);
-            if (yp < -1) yp = -1;
-            if (yp > ALT_T) yp = ALT_T;
-            ys[z][col] = (s16)yp;
-            cc[z][col] = (u8)cor;
-            if (f && f < 4 && !c_marca[i] && nobj < MAX_OBJ && (f == 1 ? z >= 2 : z > PERTO_3D)) {
-                c_marca[i] = 1;
-                objs[nobj].z = (s16)z;
-                objs[nobj].col = (s16)col;
-                objs[nobj].y = (s16)yp;
-                objs[nobj].tipo = (u8)f;
-                nobj++;
+            if (zmx < ZPERTO || zmn > ZLONGE) continue;
+            if (zmn >= ZPERTO) {
+                int x00 = v_x[g], x10 = v_x[g + 1], x01 = v_x[g + NV], x11 = v_x[g + NV + 1];
+                if (x00 * 4 >= 3 * z00 && x10 * 4 >= 3 * z10 && x01 * 4 >= 3 * z01 &&
+                    x11 * 4 >= 3 * z11) continue;
+                if (x00 * 4 <= -3 * z00 && x10 * 4 <= -3 * z10 && x01 * 4 <= -3 * z01 &&
+                    x11 * 4 <= -3 * z11) continue;
             }
+            add_item(0, i, j, zav);
+            if (f == 1 && zav >= 2 * 256) add_item(1, i, j, zav);
+            else if ((f == 2 || f == 3) && zav > PERTO_3D * 256) add_item(2, i, j, zav);
         }
     }
 
-    /* passo 2: pinta as colunas e as figuras 2D, de longe para perto */
-    int oi = 0;
-    for (z = PROF; z >= 2; z--) {
-        for (col = 0; col < LARG; col++) {
-            int yt = ys[z][col];
-            int yb = (z > 2) ? ys[z - 1][col] : ALT_T;
-            if (yb <= yt) continue;
-            if (yt < 0) yt = 0;
-            u8 cor = cc[z][col];
-            for (y = yt; y < yb; y++) fb[y][col] = cor;
-        }
-        while (oi < nobj && objs[oi].z == z) desenhar_objeto(&objs[oi++]);
-    }
+    /* ordena por profundidade (contagem) e desenha, do mais longe ao mais perto */
+    memset(it_cont, 0, sizeof it_cont);
+    for (n = 0; n < n_it; n++) it_cont[it_chave[n] + 1]++;
+    for (n = 1; n < 2 * NB + 2; n++) it_cont[n] = (u16)(it_cont[n] + it_cont[n - 1]);
+    for (n = 0; n < n_it; n++) it_ordem[it_cont[it_chave[n]]++] = (u16)n;
+    for (n = n_it - 1; n >= 0; n--) desenhar_item(it_ordem[n]);
+#ifdef TESTE_PC
+    cont_it += n_it;
+#endif
 }
 
 /* ---------------------------------------------------------------- jogador */
@@ -566,18 +837,21 @@ static void beber_pocao(void) {
 
 static int bloqueado_mundo(s32 x, s32 y) {
     int f = c_obj[idx_cel(x >> 16, y >> 16)];
-    return f == 1 || f >= 4;
+    return f == 1 || f >= 3;
 }
 
 static s32 altura_camera(void) {
     s32 pcx = wpx >> 16, pcy = wpy >> 16;
-    int m = 0;
-    for (s32 y = pcy - 2; y <= pcy + 2; y++)
-        for (s32 x = pcx - 2; x <= pcx + 2; x++) {
-            int a = c_alt[idx_cel(x, y)];
-            if (a > m) m = a;
-        }
-    return (m + 6) * 256;
+    s32 fx = (wpx >> 8) & 255, fy = (wpy >> 8) & 255;
+    s32 h00 = c_alt[idx_cel(pcx, pcy)], h10 = c_alt[idx_cel(pcx + 1, pcy)];
+    s32 h01 = c_alt[idx_cel(pcx, pcy + 1)], h11 = c_alt[idx_cel(pcx + 1, pcy + 1)];
+    s32 a = h00 * (256 - fx) + h10 * fx, b = h01 * (256 - fx) + h11 * fx;
+    s32 alvo = ((a * (256 - fy) + b * fy) >> 8) + 6 * 256;
+    s32 mx = h00 > h10 ? h00 : h10;
+    if (h01 > mx) mx = h01;
+    if (h11 > mx) mx = h11;
+    if (mx * 256 + 3 * 256 > alvo) alvo = mx * 256 + 3 * 256;
+    return alvo;
 }
 
 static void encontrar_aldeia(s32 *ox, s32 *oy) {
@@ -595,7 +869,7 @@ static void ir_para_aldeia_inicial(void) {
     s32 ax, ay;
     encontrar_aldeia(&ax, &ay);
     wpx = (ax << 16) + 32768;
-    wpy = ((ay + 6) << 16) + 32768;
+    wpy = ((ay + 4) << 16) + 32768;
     wang = 192;
     jan_valida = 0;
     janela_atualizar(wpx >> 16, wpy >> 16);
@@ -703,9 +977,9 @@ FUNC_IWRAM static void desenhar_masmorra(void) {
     int col, y;
     s32 c = COS(mang), s = SEN(mang);
     s32 planex = (-s * 169) >> 8, planey = (c * 169) >> 8;
-    for (y = 0; y < HORIZ; y++) memset(fb[y], COR_RAMPA(R_TETO, 3 + (y * 8) / HORIZ), LARG);
+    for (y = 0; y < HORIZ; y++) memset(fb[y], COR_RAMPA(R_TETO, 2 + (y * 4) / HORIZ), LARG);
     for (y = HORIZ; y < ALT_T; y++)
-        memset(fb[y], COR_RAMPA(R_CHAO, 10 - ((y - HORIZ) * 8) / HORIZ), LARG);
+        memset(fb[y], COR_RAMPA(R_CHAO, 6 - ((y - HORIZ) * 5) / HORIZ), LARG);
 
     for (col = 0; col < LARG; col++) {
         s32 camx = camx_t[col];
@@ -730,15 +1004,15 @@ FUNC_IWRAM static void desenhar_masmorra(void) {
         int ya = y0 < 0 ? 0 : y0, yb = y0 + linh > ALT_T ? ALT_T : y0 + linh;
         s32 wf = lado == 0 ? mpy + ((perp * rdy) >> 8) : mpx + ((perp * rdx) >> 8);
         int u = (wf & 255) >> 4;
-        int L = (perp * 11) >> 11;
-        if (L > 11) L = 11;
+        int L = (perp * (NIV - 1)) >> 11;
+        if (L > NIV - 1) L = NIV - 1;
         int ramp = lado ? R_TIJOLO_B : R_TIJOLO_A;
         s32 vpasso = (16 << 16) / linh, v = (ya - y0) * vpasso;
         for (y = ya; y < yb; y++) {
             int row = (v >> 16) & 15;
             v += vpasso;
             int mort = ((row & 3) == 0) || (((u + ((row >> 2) & 1) * 8) & 15) == 0);
-            int l2 = mort ? (L + 3 > 11 ? 11 : L + 3) : L;
+            int l2 = mort ? (L + 2 > NIV - 1 ? NIV - 1 : L + 2) : L;
             fb[y][col] = COR_RAMPA(ramp, l2);
         }
     }
@@ -973,7 +1247,7 @@ static void atualizar_mundo(u16 t, u16 n) {
     janela_atualizar(pcx, pcy);
     s32 alvo = altura_camera();
     wcamh += (alvo - wcamh) >> 2;
-    if (wcamh < alvo - 2 * 256) wcamh = alvo - 2 * 256;
+    if (wcamh < alvo - 3 * 256) wcamh = alvo - 3 * 256;
 
     Estrutura *e = estrutura_bloco(pcx >> 5, pcy >> 5);
     if (e->tipo && ABS(pcx - e->cx) <= 3 && ABS(pcy - e->cy) <= 3) {
@@ -1048,13 +1322,14 @@ static void desenhar_mapa(void) {
     s32 x0 = pcx - LARG, y0 = pcy - ALT_T;
     for (int y = 0; y < ALT_T; y++)
         for (int x = 0; x < LARG; x++) {
+            static const u8 rm[5] = {R_AGUA, R_AREIA, R_GRAMA + 1, R_ROCHA + 1, R_NEVE};
             int a = altura_bruta(x0 + x * 2, y0 + y * 2), r;
             if (a < NIVEL_AGUA) r = 0;
             else if (a < NIVEL_AGUA + 3) r = 1;
-            else if (a < LIM_ROCHA) r = 3;
-            else if (a < LIM_NEVE) r = 5;
-            else r = 7;
-            fb[y][x] = (u8)COR_RAMPA(r, 1);
+            else if (a < LIM_ROCHA) r = 2;
+            else if (a < LIM_NEVE) r = 3;
+            else r = 4;
+            fb[y][x] = (u8)COR_RAMPA(rm[r], 1);
         }
     for (s32 by = (y0 >> 5) - 1; by <= ((y0 + 2 * ALT_T) >> 5) + 1; by++)
         for (s32 bx = (x0 >> 5) - 1; bx <= ((x0 + 2 * LARG) >> 5) + 1; bx++) {
@@ -1229,10 +1504,6 @@ static void iniciar_tabelas(void) {
     int i;
     for (i = 0; i < 256; i++) sen_t[i] = (s16)lround(256.0 * sin(i * 6.283185307179586 / 256.0));
     for (i = 0; i < LARG; i++) camx_t[i] = (s16)(((2 * i - (LARG - 1)) * 256) / (LARG - 1));
-    for (i = 1; i <= PROF; i++) {
-        nevoa_t[i] = (u8)((i * 11) / PROF);
-        mul_t[i] = (ESCALA_V * 256) / i;
-    }
 }
 
 #ifndef TESTE_PC
