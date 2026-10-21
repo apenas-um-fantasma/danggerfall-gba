@@ -358,20 +358,30 @@ static void figura_escalada(const u8 *img, int sw, int sh, int x0, int y0, int d
 }
 
 /* ------------------------------------------------ relevo: malha de polígonos */
-#define ALC 12                    /* alcance da visão, em células */
+#define ALC 28                    /* alcance da visão, em células */
 #define NV (2 * ALC + 1)
 #define ZPERTO 96                 /* plano de corte próximo (8.8) */
 #define ZLONGE (ALC * 256)
 #define NB 160
 #define MAXIT 1800
+#define MAXTV 3200
 #define FOCO_H 80
 #define FOCO_V 28
+#ifndef OCLUSAO
+#define OCLUSAO 1                 /* descarta triângulos escondidos atrás do relevo */
+#endif
+#define FOLGA_FATIAS 3            /* só esconde o que está 3 fatias (de 1 célula) atrás */
 
 typedef struct { s32 x, y, z; } Pt;
 typedef int64_t s64;
 
 static s32 g_camh, g_rx, g_ry, g_c, g_s, g_pcx, g_pcy;
 static int g_i_atual, g_j_atual;
+static int g_hz;                  /* linha do horizonte na tela */
+static int inclina;               /* inclinação da cabeça, em linhas da tela (+ = olhando para cima) */
+static int cab_yaw;               /* giro da cabeça em relação ao corpo (256 = volta completa) */
+#define INCL_MAX 22
+#define YAW_MAX 64
 static s16 v_z[NV * NV] DADOS_EWRAM;
 static s16 v_x[NV * NV] DADOS_EWRAM;
 static s16 p_x[NV * NV] DADOS_EWRAM;
@@ -380,13 +390,18 @@ static u8 p_ok[NV * NV] DADOS_EWRAM;
 static u8 it_k[MAXIT] DADOS_EWRAM;
 static s8 it_i[MAXIT] DADOS_EWRAM;
 static s8 it_j[MAXIT] DADOS_EWRAM;
+static u8 it_vis[MAXIT] DADOS_EWRAM;
 static u16 it_chave[MAXIT] DADOS_EWRAM;
 static u16 it_ordem[MAXIT] DADOS_EWRAM;
 static u16 it_cont[2 * NB + 2] DADOS_EWRAM;
-static int n_it;
-static s16 lim_e[ALT_T], lim_d[ALT_T];
+static s16 tv[MAXTV][6] DADOS_EWRAM;
+static u8 tv_fatia[MAXTV] DADOS_EWRAM;
+static int n_it, n_tv, tv_conf;
+static s16 horiz[LARG];
+static int fx_lo[2 * ALC], fx_hi[2 * ALC];
+static s32 inv_t[256];
 #ifdef TESTE_PC
-static long cont_pix, cont_poly, cont_it, cont_tri;
+static long cont_pix, cont_poly, cont_it, cont_tri, cont_corte;
 #endif
 
 static const u8 R_BASE[5][4] = {
@@ -396,6 +411,8 @@ static const u8 R_BASE[5][4] = {
     {R_ROCHA, R_ROCHA + 1, R_ROCHA + 2, R_ROCHA + 3},
     {R_NEVE, R_NEVE, R_NEVE + 1, R_NEVE + 2}};
 
+#define PASSO(dx, dy) (((u32)(dy) < 256u) ? ((dx) * inv_t[(dy)]) : (((dx) * 65536) / (dy)))
+
 static void cam_ponto(s32 X8, s32 Y8, s32 H8, Pt *p) {
     s32 dx = X8 - g_rx, dy = Y8 - g_ry;
     p->z = (dx * g_c + dy * g_s) >> 8;
@@ -403,24 +420,85 @@ static void cam_ponto(s32 X8, s32 Y8, s32 H8, Pt *p) {
     p->y = g_camh - H8;
 }
 
+static int prof_ponto(s32 wx, s32 wy) {
+    s32 dx = wx * 256 - g_rx, dy = wy * 256 - g_ry;
+    return (int)((dx * g_c + dy * g_s) >> 8);
+}
+
 static int nivel_nevoa(s32 z) {
     s32 l = ((z - 3 * 256) * (NIV - 1)) / (ZLONGE - 3 * 256);
     return l < 0 ? 0 : (l > NIV - 1 ? NIV - 1 : (int)l);
 }
 
-/* preenche um polígono convexo já em coordenadas de tela */
+/* preenche n bytes iguais, de 4 em 4 quando possível */
+static inline __attribute__((always_inline)) void preencher(u8 *d, int n, u8 cor) {
+    while (n > 0 && ((uintptr_t)d & 3)) { *d++ = cor; n--; }
+    u32 w = (u32)cor * 0x01010101u;
+    while (n >= 4) { *(u32 *)d = w; d += 4; n -= 4; }
+    while (n > 0) { *d++ = cor; n--; }
+}
+
+static inline __attribute__((always_inline)) void linha_tela(int y, s32 a, s32 b, u8 cor) {
+    s32 l = a < b ? a : b, r = a < b ? b : a;
+    if (l < 0) l = 0;
+    if (r >= LARG) r = LARG - 1;
+    if (l > r) return;
+    preencher(&fb[y][l], (int)(r - l + 1), cor);
+#ifdef TESTE_PC
+    cont_pix += r - l + 1;
+#endif
+}
+
+/* triângulo já em coordenadas de tela (caminho rápido) */
+FUNC_IWRAM static void tri_tela(s32 x0, s32 y0, s32 x1, s32 y1, s32 x2, s32 y2, u8 cor) {
+    s32 t;
+    if (y0 > y1) { t = x0; x0 = x1; x1 = t; t = y0; y0 = y1; y1 = t; }
+    if (y1 > y2) { t = x1; x1 = x2; x2 = t; t = y1; y1 = y2; y2 = t; }
+    if (y0 > y1) { t = x0; x0 = x1; x1 = t; t = y0; y0 = y1; y1 = t; }
+    if (y2 < 0 || y0 >= ALT_T) return;
+    {
+        s32 xmn = x0 < x1 ? x0 : x1, xmx = x0 < x1 ? x1 : x0;
+        if (x2 < xmn) xmn = x2;
+        if (x2 > xmx) xmx = x2;
+        if (xmx < 0 || xmn >= LARG) return;
+    }
+    int ys = y0 < 0 ? 0 : (int)y0, ye = y2 >= ALT_T ? ALT_T - 1 : (int)y2, y;
+    s32 dy02 = y2 - y0, dy01 = y1 - y0, dy12 = y2 - y1;
+    s32 dxa = x2 - x0, dxb = x1 - x0, dxc = x2 - x1;
+    s32 pa = dy02 ? PASSO(dxa, dy02) : 0;
+    s32 pb = dy01 ? PASSO(dxb, dy01) : 0;
+    s32 pc = dy12 ? PASSO(dxc, dy12) : 0;
+    s64 xa = ((s64)x0 * 65536) + (s64)pa * (ys - y0), xb;
+    y = ys;
+    if (y < y1) {
+        xb = ((s64)x0 * 65536) + (s64)pb * (y - y0);
+        for (; y < y1 && y <= ye; y++, xa += pa, xb += pb)
+            linha_tela(y, (s32)(xa >> 16), (s32)(xb >> 16), cor);
+    }
+    if (y <= ye) {
+        xb = ((s64)x1 * 65536) + (s64)pc * (y - y1);
+        for (; y <= ye; y++, xa += pa, xb += pc)
+            linha_tela(y, (s32)(xa >> 16), (s32)(xb >> 16), cor);
+    }
+#ifdef TESTE_PC
+    cont_poly++;
+#endif
+}
+
+/* polígono convexo qualquer, em coordenadas de tela */
 FUNC_IWRAM static void poligono_tela(const s32 *px, const s32 *py, int n, u8 cor) {
     int ymin = 32767, ymax = -32768, i, y;
     s32 xmin = 32767, xmax = -32768;
     for (i = 0; i < n; i++) {
-        if (py[i] < ymin) ymin = py[i];
-        if (py[i] > ymax) ymax = py[i];
+        if (py[i] < ymin) ymin = (int)py[i];
+        if (py[i] > ymax) ymax = (int)py[i];
         if (px[i] < xmin) xmin = px[i];
         if (px[i] > xmax) xmax = px[i];
     }
     if (ymax < 0 || ymin >= ALT_T || xmax < 0 || xmin >= LARG) return;
     if (ymin < 0) ymin = 0;
     if (ymax >= ALT_T) ymax = ALT_T - 1;
+    static s16 lim_e[ALT_T], lim_d[ALT_T];
     for (y = ymin; y <= ymax; y++) { lim_e[y] = 32767; lim_d[y] = -32768; }
     for (i = 0; i < n; i++) {
         s32 x0 = px[i], y0 = py[i];
@@ -436,7 +514,8 @@ FUNC_IWRAM static void poligono_tela(const s32 *px, const s32 *py, int n, u8 cor
         }
         if (y0 > y1) { s32 t = x0; x0 = x1; x1 = t; t = y0; y0 = y1; y1 = t; }
         if (y1 < 0 || y0 >= ALT_T) continue;
-        s32 passo = ((x1 - x0) * 65536) / (y1 - y0);
+        s32 dx = x1 - x0, dy = y1 - y0;
+        s32 passo = PASSO(dx, dy);
         int ya = y0 < 0 ? 0 : (int)y0, yb = y1 >= ALT_T ? ALT_T - 1 : (int)y1;
         s64 x = ((s64)x0 * 65536) + (s64)passo * (ya - y0);
         for (y = ya; y <= yb; y++, x += passo) {
@@ -446,15 +525,8 @@ FUNC_IWRAM static void poligono_tela(const s32 *px, const s32 *py, int n, u8 cor
         }
     }
     for (y = ymin; y <= ymax; y++) {
-        int l = lim_e[y], r = lim_d[y];
-        if (l > r) continue;
-        if (l < 0) l = 0;
-        if (r >= LARG) r = LARG - 1;
-        if (l > r) continue;
-        memset(&fb[y][l], cor, (size_t)(r - l + 1));
-#ifdef TESTE_PC
-        cont_pix += r - l + 1;
-#endif
+        if (lim_e[y] > lim_d[y]) continue;
+        linha_tela(y, lim_e[y], lim_d[y], cor);
     }
 #ifdef TESTE_PC
     cont_poly++;
@@ -481,7 +553,7 @@ static void poligono_cam(const Pt *in, int n, u8 cor) {
     if (m < 3) return;
     for (a = 0; a < m; a++) {
         sx[a] = LARG / 2 + (out[a].x * FOCO_H) / out[a].z;
-        sy[a] = HORIZ + (out[a].y * FOCO_V) / out[a].z;
+        sy[a] = g_hz + (out[a].y * FOCO_V) / out[a].z;
     }
     poligono_tela(sx, sy, m, cor);
 }
@@ -489,9 +561,25 @@ static void poligono_cam(const Pt *in, int n, u8 cor) {
 static void proj_vert(int g, int cel) {
     s32 z = v_z[g];
     p_x[g] = (s16)(LARG / 2 + (v_x[g] * FOCO_H) / z);
-    p_y[g] = (s16)(HORIZ + ((g_camh - c_alt[cel] * 256) * FOCO_V) / z);
+    p_y[g] = (s16)(g_hz + ((g_camh - c_alt[cel] * 256) * FOCO_V) / z);
     p_ok[g] = 1;
 }
+
+static void cel_prepara(int i, int j, int *g, int *cel, int *h, int *par) {
+    s32 wx = g_pcx + i, wy = g_pcy + j;
+    g[0] = (j + ALC) * NV + (i + ALC);
+    g[1] = g[0] + 1;
+    g[2] = g[0] + NV;
+    g[3] = g[2] + 1;
+    cel[0] = idx_cel(wx, wy);
+    cel[1] = idx_cel(wx + 1, wy);
+    cel[2] = idx_cel(wx, wy + 1);
+    cel[3] = idx_cel(wx + 1, wy + 1);
+    for (int k = 0; k < 4; k++) h[k] = c_alt[cel[k]];
+    *par = (int)((wx + wy) & 1);
+}
+
+static const u8 TRIS[2][2][3] = {{{0, 1, 3}, {0, 3, 2}}, {{0, 1, 2}, {1, 3, 2}}};
 
 static void tri_malha(const int *g, const int *cel, const int *h, int a, int b, int c, int par) {
     static const s8 kx[4] = {0, 1, 0, 1}, ky[4] = {0, 0, 1, 1};
@@ -521,8 +609,7 @@ static void tri_malha(const int *g, const int *cel, const int *h, int a, int b, 
         if (!p_ok[ga]) proj_vert(ga, cel[a]);
         if (!p_ok[gb]) proj_vert(gb, cel[b]);
         if (!p_ok[gc]) proj_vert(gc, cel[c]);
-        s32 sx[3] = {p_x[ga], p_x[gb], p_x[gc]}, sy[3] = {p_y[ga], p_y[gb], p_y[gc]};
-        poligono_tela(sx, sy, 3, cor);
+        tri_tela(p_x[ga], p_y[ga], p_x[gb], p_y[gb], p_x[gc], p_y[gc], cor);
     } else {
         Pt p[3];
         p[0].x = v_x[ga]; p[0].z = v_z[ga]; p[0].y = g_camh - h[a] * 256;
@@ -532,27 +619,90 @@ static void tri_malha(const int *g, const int *cel, const int *h, int a, int b, 
     }
 }
 
-static void celula_malha(int i, int j) {
-    int g[4], cel[4], h[4], k;
-    s32 wx = g_pcx + i, wy = g_pcy + j;
-    g[0] = (j + ALC) * NV + (i + ALC);
-    g[1] = g[0] + 1;
-    g[2] = g[0] + NV;
-    g[3] = g[2] + 1;
-    cel[0] = idx_cel(wx, wy);
-    cel[1] = idx_cel(wx + 1, wy);
-    cel[2] = idx_cel(wx, wy + 1);
-    cel[3] = idx_cel(wx + 1, wy + 1);
-    for (k = 0; k < 4; k++) h[k] = c_alt[cel[k]];
-    int par = (int)((wx + wy) & 1);
+static void celula_malha(int i, int j, int vis) {
+    int g[4], cel[4], h[4], par;
+    cel_prepara(i, j, g, cel, h, &par);
     g_i_atual = i;
     g_j_atual = j;
-    if (par == 0) {
-        tri_malha(g, cel, h, 0, 1, 3, par);
-        tri_malha(g, cel, h, 0, 3, 2, par + 1);
-    } else {
-        tri_malha(g, cel, h, 0, 1, 2, par);
-        tri_malha(g, cel, h, 1, 3, 2, par + 1);
+    if (vis & 1) tri_malha(g, cel, h, TRIS[par][0][0], TRIS[par][0][1], TRIS[par][0][2], par);
+    if (vis & 2) tri_malha(g, cel, h, TRIS[par][1][0], TRIS[par][1][1], TRIS[par][1][2], par + 1);
+}
+
+/* ---- descarte de triângulos escondidos (de perto para longe) ---- */
+static void horizonte_somar(const s16 *t) {
+    for (int e = 0; e < 3; e++) {
+        int b = (e == 2) ? 0 : e + 1;
+        s32 x0 = t[e * 2], y0 = t[e * 2 + 1], x1 = t[b * 2], y1 = t[b * 2 + 1], tmp;
+        if (x0 > x1) { tmp = x0; x0 = x1; x1 = tmp; tmp = y0; y0 = y1; y1 = tmp; }
+        if (x1 < 0 || x0 >= LARG) continue;
+        if (x0 == x1) {
+            int yy = (int)(y0 < y1 ? y0 : y1);
+            if (yy < horiz[x0]) horiz[x0] = (s16)(yy < -1 ? -1 : yy);
+            continue;
+        }
+        s32 dx = x1 - x0, dy = y1 - y0;
+        s32 passo = PASSO(dy, dx);
+        int xs = x0 < 0 ? 0 : (int)x0, xe = x1 >= LARG ? LARG - 1 : (int)x1, x;
+        s64 y = ((s64)y0 * 65536) + (s64)passo * (xs - x0);
+        for (x = xs; x <= xe; x++, y += passo) {
+            int yi = (int)(y >> 16);
+            if (yi < horiz[x]) horiz[x] = (s16)(yi < -1 ? -1 : yi);
+        }
+    }
+}
+
+FUNC_IWRAM static void descartar_ocultos(void) {
+    int n, x;
+    for (x = 0; x < LARG; x++) horiz[x] = ALT_T;
+    n_tv = 0;
+    tv_conf = 0;
+    for (n = 0; n < n_it; n++) {
+        int o = it_ordem[n];
+        if (it_k[o] != 0) continue;
+        int fatia = (it_chave[o] >> 1) >> 2;
+        while (tv_conf < n_tv && tv_fatia[tv_conf] <= fatia - FOLGA_FATIAS)
+            horizonte_somar(tv[tv_conf++]);
+        int g[4], cel[4], h[4], par, t;
+        cel_prepara(it_i[o], it_j[o], g, cel, h, &par);
+        for (t = 0; t < 2; t++) {
+            int ga = g[TRIS[par][t][0]], gb = g[TRIS[par][t][1]], gc = g[TRIS[par][t][2]];
+            if (v_z[ga] < ZPERTO || v_z[gb] < ZPERTO || v_z[gc] < ZPERTO) continue;
+            if (!p_ok[ga]) proj_vert(ga, cel[TRIS[par][t][0]]);
+            if (!p_ok[gb]) proj_vert(gb, cel[TRIS[par][t][1]]);
+            if (!p_ok[gc]) proj_vert(gc, cel[TRIS[par][t][2]]);
+            int xa = p_x[ga], ya = p_y[ga], xb = p_x[gb], yb = p_y[gb], xc = p_x[gc], yc = p_y[gc];
+            int xmn = xa < xb ? xa : xb, xmx = xa < xb ? xb : xa;
+            int ymn = ya < yb ? ya : yb, ymx = ya < yb ? yb : ya;
+            if (xc < xmn) xmn = xc;
+            if (xc > xmx) xmx = xc;
+            if (yc < ymn) ymn = yc;
+            if (yc > ymx) ymx = yc;
+            if (xmx < 0 || xmn >= LARG || ymx < 0 || ymn >= ALT_T) {
+                it_vis[o] &= (u8)~(1 << t);
+#ifdef TESTE_PC
+                cont_corte++;
+#endif
+                continue;
+            }
+            int hmax = -1000;
+            int x0 = xmn < 0 ? 0 : xmn, x1 = xmx >= LARG ? LARG - 1 : xmx;
+            for (x = x0; x <= x1; x++)
+                if (horiz[x] > hmax) hmax = horiz[x];
+            if (ymn >= hmax + 2) {
+                it_vis[o] &= (u8)~(1 << t);
+#ifdef TESTE_PC
+                cont_corte++;
+#endif
+                continue;
+            }
+            if (n_tv < MAXTV) {
+                tv[n_tv][0] = (s16)xa; tv[n_tv][1] = (s16)ya;
+                tv[n_tv][2] = (s16)xb; tv[n_tv][3] = (s16)yb;
+                tv[n_tv][4] = (s16)xc; tv[n_tv][5] = (s16)yc;
+                tv_fatia[n_tv] = (u8)fatia;
+                n_tv++;
+            }
+        }
     }
 }
 
@@ -564,7 +714,7 @@ static void item_figura(int i, int j, int tipo) {
     s32 wx = g_pcx + i, wy = g_pcy + j;
     s32 hh = (c_alt[idx_cel(wx, wy)] + c_alt[idx_cel(wx + 1, wy + 1)]) * 128;
     int sx = LARG / 2 + (int)((x * FOCO_H) / z);
-    int sy = HORIZ + (int)(((g_camh - hh) * FOCO_V) / z);
+    int sy = g_hz + (int)(((g_camh - hh) * FOCO_V) / z);
     int esc = (5 * 65536) / z;
     const u8 *img;
     int sw, sh;
@@ -608,7 +758,6 @@ static void desenhar_casa(int i, int j) {
         parede(&d0, &d1, &d2, &d3, COR_PORTA);
     }
     if (g_rx < X0) parede(&b[3], &b[0], &t[0], &t[3], (u8)COR_RAMPA(R_CASA, L));
-    /* telhado: quatro triângulos, do mais longe para o mais perto */
     int ordem[4] = {0, 1, 2, 3}, zt[4], a2, b2;
     for (k = 0; k < 4; k++) zt[k] = (t[k].z + t[(k + 1) & 3].z + ap.z) / 3;
     for (a2 = 1; a2 < 4; a2++)
@@ -658,22 +807,15 @@ static void add_item(int k, int i, int j, int z) {
     it_k[n_it] = (u8)k;
     it_i[n_it] = (s8)i;
     it_j[n_it] = (s8)j;
+    it_vis[n_it] = 3;
     it_chave[n_it] = (u16)((b << 1) | (k != 0));
     n_it++;
-}
-
-static int z_canto(int i, int j) {
-    if (i < -ALC) i = -ALC;
-    if (i > ALC) i = ALC;
-    if (j < -ALC) j = -ALC;
-    if (j > ALC) j = ALC;
-    return v_z[(j + ALC) * NV + (i + ALC)];
 }
 
 static void desenhar_item(int n) {
     int k = it_k[n], i = it_i[n], j = it_j[n];
     switch (k) {
-    case 0: celula_malha(i, j); break;
+    case 0: celula_malha(i, j, it_vis[n]); break;
     case 1: item_figura(i, j, 1); break;
     case 2: item_figura(i, j, c_obj[idx_cel(g_pcx + i, g_pcy + j)] == 2 ? 2 : 3); break;
     case 3: desenhar_casa(i, j); break;
@@ -681,10 +823,24 @@ static void desenhar_item(int n) {
     }
 }
 
+/* resolve a*i <= b para i inteiro, estreitando [lo, hi] */
+static int divpiso(int n, int d) { return n >= 0 ? n / d : -((-n + d - 1) / d); }
+static void faixa(int a, int b, int *lo, int *hi) {
+    if (a > 0) { int v = divpiso(b, a); if (v < *hi) *hi = v; }
+    else if (a < 0) { int v = -divpiso(b, -a); if (v > *lo) *lo = v; }
+    else if (b < 0) { *lo = 1; *hi = 0; }
+}
+
 FUNC_IWRAM static void desenhar_relevo(s32 px, s32 py, int ang, s32 camh) {
     int i, j, y, n;
-    for (y = 0; y < HORIZ; y++) memset(fb[y], COR_CEU0 + (y * COR_CEU_N) / HORIZ, LARG);
-    for (; y < ALT_T; y++) memset(fb[y], COR_CEU9, LARG);
+    g_hz = HORIZ + inclina;
+    for (y = 0; y < ALT_T; y++) {
+        int idx = ((y + HORIZ - g_hz) * COR_CEU_N) / HORIZ;
+        if (y >= g_hz) idx = COR_CEU_N - 1;
+        if (idx < 0) idx = 0;
+        if (idx > COR_CEU_N - 1) idx = COR_CEU_N - 1;
+        memset(fb[y], COR_CEU0 + idx, LARG);
+    }
     g_camh = camh;
     g_c = COS(ang);
     g_s = SEN(ang);
@@ -695,11 +851,29 @@ FUNC_IWRAM static void desenhar_relevo(s32 px, s32 py, int ang, s32 camh) {
     s32 fxp = g_rx & 255, fyp = g_ry & 255;
     s32 Z0 = (-(fxp * g_c) - fyp * g_s) >> 8, X0 = (fxp * g_s - fyp * g_c) >> 8;
 
-    /* posição de cada vértice da malha na câmera (somas incrementais) */
+    /* para cada linha de células, só o trecho que cabe no cone de visão */
+    for (j = -ALC; j < ALC; j++) {
+        int lo = -ALC, hi = ALC - 1;
+        int A = Z0 + j * g_s + ((g_c + g_s) >> 1), B = X0 + j * g_c + ((g_c - g_s) >> 1);
+        faixa(-g_c, A - (ZPERTO - 600), &lo, &hi);
+        faixa(g_c, (ZLONGE + 384) - A, &lo, &hi);
+        faixa(-4 * g_s - 3 * g_c, 2600 - 4 * B + 3 * A, &lo, &hi);
+        faixa(4 * g_s - 3 * g_c, 2600 + 4 * B + 3 * A, &lo, &hi);
+        fx_lo[j + ALC] = lo;
+        fx_hi[j + ALC] = hi;
+    }
+    /* posição na câmera só dos vértices que serão usados */
     for (j = 0; j < NV; j++) {
-        s32 zb = Z0 + (j - ALC) * g_s - ALC * g_c, xb = X0 + (j - ALC) * g_c + ALC * g_s;
-        s16 *pz = &v_z[j * NV], *pxx = &v_x[j * NV];
-        for (i = 0; i < NV; i++) {
+        int vlo = 1000, vhi = -1000;
+        if (j > 0 && fx_lo[j - 1] <= fx_hi[j - 1]) { vlo = fx_lo[j - 1]; vhi = fx_hi[j - 1] + 1; }
+        if (j < NV - 1 && fx_lo[j] <= fx_hi[j]) {
+            if (fx_lo[j] < vlo) vlo = fx_lo[j];
+            if (fx_hi[j] + 1 > vhi) vhi = fx_hi[j] + 1;
+        }
+        if (vlo > vhi) continue;
+        s32 zb = Z0 + (j - ALC) * g_s + vlo * g_c, xb = X0 + (j - ALC) * g_c - vlo * g_s;
+        s16 *pz = &v_z[j * NV + ALC], *pxx = &v_x[j * NV + ALC];
+        for (i = vlo; i <= vhi; i++) {
             pz[i] = (s16)zb;
             pxx[i] = (s16)xb;
             zb += g_c;
@@ -711,7 +885,7 @@ FUNC_IWRAM static void desenhar_relevo(s32 px, s32 py, int ang, s32 camh) {
     /* escolhe o que desenhar */
     n_it = 0;
     for (j = -ALC; j < ALC; j++) {
-        for (i = -ALC; i < ALC; i++) {
+        for (i = fx_lo[j + ALC]; i <= fx_hi[j + ALC]; i++) {
             int g = (j + ALC) * NV + (i + ALC);
             int z00 = v_z[g], z10 = v_z[g + 1], z01 = v_z[g + NV], z11 = v_z[g + NV + 1];
             int zmx = z00, zmn = z00;
@@ -721,17 +895,20 @@ FUNC_IWRAM static void desenhar_relevo(s32 px, s32 py, int ang, s32 camh) {
             int zav = (z00 + z10 + z01 + z11) >> 2;
             int f = c_obj[idx_cel(g_pcx + i, g_pcy + j)];
             if ((f == 5 || f == 3) && zav <= PERTO_3D * 256 && zav > -3 * 256) {
+                s32 wx = g_pcx + i, wy = g_pcy + j;
                 int zc;
                 if (f == 5) {
-                    zc = z_canto(i - 1, j - 1);
-                    if (z_canto(i + 2, j - 1) < zc) zc = z_canto(i + 2, j - 1);
-                    if (z_canto(i - 1, j + 2) < zc) zc = z_canto(i - 1, j + 2);
-                    if (z_canto(i + 2, j + 2) < zc) zc = z_canto(i + 2, j + 2);
+                    zc = prof_ponto(wx - 1, wy - 1);
+                    int t1 = prof_ponto(wx + 2, wy - 1), t2 = prof_ponto(wx - 1, wy + 2), t3 = prof_ponto(wx + 2, wy + 2);
+                    if (t1 < zc) zc = t1;
+                    if (t2 < zc) zc = t2;
+                    if (t3 < zc) zc = t3;
                 } else {
-                    zc = z_canto(i - 1, j - 1);
-                    if (z_canto(i + 2, j - 1) < zc) zc = z_canto(i + 2, j - 1);
-                    if (z_canto(i - 1, j + 1) < zc) zc = z_canto(i - 1, j + 1);
-                    if (z_canto(i + 2, j + 1) < zc) zc = z_canto(i + 2, j + 1);
+                    zc = prof_ponto(wx - 1, wy - 1);
+                    int t1 = prof_ponto(wx + 2, wy - 1), t2 = prof_ponto(wx - 1, wy + 1), t3 = prof_ponto(wx + 2, wy + 1);
+                    if (t1 < zc) zc = t1;
+                    if (t2 < zc) zc = t2;
+                    if (t3 < zc) zc = t3;
                 }
                 add_item(f == 5 ? 3 : 4, i, j, zc);
             }
@@ -749,11 +926,15 @@ FUNC_IWRAM static void desenhar_relevo(s32 px, s32 py, int ang, s32 camh) {
         }
     }
 
-    /* ordena por profundidade (contagem) e desenha, do mais longe ao mais perto */
+    /* ordena por profundidade (contagem) */
     memset(it_cont, 0, sizeof it_cont);
     for (n = 0; n < n_it; n++) it_cont[it_chave[n] + 1]++;
     for (n = 1; n < 2 * NB + 2; n++) it_cont[n] = (u16)(it_cont[n] + it_cont[n - 1]);
     for (n = 0; n < n_it; n++) it_ordem[it_cont[it_chave[n]]++] = (u16)n;
+#if OCLUSAO
+    descartar_ocultos();
+#endif
+    /* desenha do mais longe ao mais perto */
     for (n = n_it - 1; n >= 0; n--) desenhar_item(it_ordem[n]);
 #ifdef TESTE_PC
     cont_it += n_it;
@@ -826,6 +1007,25 @@ static int carregar_ok(void) {
 
 static void aviso(const char *t) { aviso_txt = t; aviso_t = 90; }
 
+/* R pressionado: as setas movem a cabeça. Ao soltar, ela volta ao centro. */
+static void atualizar_olhar(u16 t) {
+    if (t & TC_R) {
+        if (t & TC_CIMA) inclina += 2;
+        if (t & TC_BAIXO) inclina -= 2;
+        if (t & TC_DIR) cab_yaw += 4;
+        if (t & TC_ESQ) cab_yaw -= 4;
+        if (inclina > INCL_MAX) inclina = INCL_MAX;
+        if (inclina < -INCL_MAX) inclina = -INCL_MAX;
+        if (cab_yaw > YAW_MAX) cab_yaw = YAW_MAX;
+        if (cab_yaw < -YAW_MAX) cab_yaw = -YAW_MAX;
+    } else {
+        if (inclina > 0) inclina = inclina > 3 ? inclina - 3 : 0;
+        else if (inclina < 0) inclina = inclina < -3 ? inclina + 3 : 0;
+        if (cab_yaw > 0) cab_yaw = cab_yaw > 6 ? cab_yaw - 6 : 0;
+        else if (cab_yaw < 0) cab_yaw = cab_yaw < -6 ? cab_yaw + 6 : 0;
+    }
+}
+
 static void beber_pocao(void) {
     if (pocoes <= 0) { aviso("SEM POÇÕES!"); return; }
     if (vida >= vida_max) { aviso("VIDA JÁ ESTÁ CHEIA."); return; }
@@ -889,6 +1089,8 @@ static void carregar_jogo(void) {
     folego_max = 30;
     if (vida > vida_max) vida = vida_max;
     modo = MODO_MUNDO;
+    inclina = 0;
+    cab_yaw = 0;
     jan_valida = 0;
     janela_atualizar(wpx >> 16, wpy >> 16);
     wcamh = altura_camera();
@@ -900,6 +1102,8 @@ static void jogo_novo(void) {
     vida_max = 20; vida = vida_max;
     folego_max = 30; folego = folego_max;
     modo = MODO_MUNDO;
+    inclina = 0;
+    cab_yaw = 0;
     ir_para_aldeia_inicial();
 }
 
@@ -974,12 +1178,23 @@ static int livre(s32 x, s32 y, int r) {
 }
 
 FUNC_IWRAM static void desenhar_masmorra(void) {
-    int col, y;
-    s32 c = COS(mang), s = SEN(mang);
+    int col, y, hz = HORIZ + inclina;
+    s32 c = COS(mang + cab_yaw), s = SEN(mang + cab_yaw);
     s32 planex = (-s * 169) >> 8, planey = (c * 169) >> 8;
-    for (y = 0; y < HORIZ; y++) memset(fb[y], COR_RAMPA(R_TETO, 2 + (y * 4) / HORIZ), LARG);
-    for (y = HORIZ; y < ALT_T; y++)
-        memset(fb[y], COR_RAMPA(R_CHAO, 6 - ((y - HORIZ) * 5) / HORIZ), LARG);
+    for (y = 0; y < ALT_T; y++) {
+        int l;
+        if (y < hz) {
+            int yr = y + HORIZ - hz;
+            if (yr < 0) yr = 0;
+            l = 2 + (yr * 4) / HORIZ;
+            if (l > NIV - 1) l = NIV - 1;
+            memset(fb[y], COR_RAMPA(R_TETO, l), LARG);
+        } else {
+            l = (NIV - 1) - ((y - hz) * 5) / HORIZ;
+            if (l < 1) l = 1;
+            memset(fb[y], COR_RAMPA(R_CHAO, l), LARG);
+        }
+    }
 
     for (col = 0; col < LARG; col++) {
         s32 camx = camx_t[col];
@@ -1000,7 +1215,7 @@ FUNC_IWRAM static void desenhar_masmorra(void) {
         if (perp < 40) perp = 40;
         zbuf[col] = perp;
         s32 linh = (ALT_T * 256) / perp;
-        int y0 = HORIZ - linh / 2;
+        int y0 = hz - linh / 2;
         int ya = y0 < 0 ? 0 : y0, yb = y0 + linh > ALT_T ? ALT_T : y0 + linh;
         s32 wf = lado == 0 ? mpy + ((perp * rdy) >> 8) : mpx + ((perp * rdx) >> 8);
         int u = (wf & 255) >> 4;
@@ -1019,7 +1234,7 @@ FUNC_IWRAM static void desenhar_masmorra(void) {
 }
 
 static void projetar(s32 ex, s32 ey, s32 *tx, s32 *ty) {
-    s32 c = COS(mang), s = SEN(mang);
+    s32 c = COS(mang + cab_yaw), s = SEN(mang + cab_yaw);
     s32 planex = (-s * 169) >> 8, planey = (c * 169) >> 8;
     s32 det = planex * s - c * planey;
     s32 dx = ex - mpx, dy = ey - mpy;
@@ -1047,7 +1262,7 @@ static void desenhar_inimigos(void) {
         int sxc = LARG / 2 + (60 * tx) / ty;
         s32 linh = (ALT_T * 256) / ty;
         int dh = (linh * 3) / 4, dw = (dh * 3) / 4;
-        int ybase = HORIZ + linh / 2;
+        int ybase = HORIZ + inclina + linh / 2;
         int quadro = e->flash ? 2 : ((e->anim >> 3) & 1);
         figura_escalada(FIG_INIMIGO[quadro], INIMIGO_L, INIMIGO_A, sxc - dw / 2, ybase - dh, dw,
                         dh, zbuf, ty);
@@ -1116,10 +1331,13 @@ static void atualizar_masmorra(u16 t, u16 n) {
     static const int custo[3] = {8, 14, 10};
     s32 c = COS(mang), s = SEN(mang);
     s32 nx, ny;
+    int olhando = (t & TC_R) != 0;       /* R + setas controlam só a cabeça */
     anim_andar = 0;
-    if (t & TC_ESQ) mang -= 3;
-    if (t & TC_DIR) mang += 3;
-    if (t & (TC_CIMA | TC_BAIXO)) {
+    if (!olhando && !(t & TC_L)) {
+        if (t & TC_ESQ) mang -= 3;
+        if (t & TC_DIR) mang += 3;
+    }
+    if (!olhando && (t & (TC_CIMA | TC_BAIXO))) {
         int sg = (t & TC_CIMA) ? 1 : -1;
         nx = mpx + sg * ((c * VEL_ANDAR) >> 8);
         ny = mpy + sg * ((s * VEL_ANDAR) >> 8);
@@ -1127,8 +1345,8 @@ static void atualizar_masmorra(u16 t, u16 n) {
         if (livre(mpx, ny, 50)) mpy = ny;
         anim_andar = 1 + (aleatorio() & 15);
     }
-    if (t & (TC_L | TC_R)) {
-        int sg = (t & TC_R) ? 1 : -1;
+    if (!olhando && (t & TC_L) && (t & (TC_ESQ | TC_DIR))) {
+        int sg = (t & TC_DIR) ? 1 : -1;
         nx = mpx + sg * ((-s * VEL_ANDAR) >> 8);
         ny = mpy + sg * ((c * VEL_ANDAR) >> 8);
         if (livre(nx, mpy, 50)) mpx = nx;
@@ -1139,7 +1357,7 @@ static void atualizar_masmorra(u16 t, u16 n) {
         if (atq_t == 5) atacar();
         if (atq_t > 10) atq_t = 0;
     } else if (n & TC_A) {
-        int tipo = (t & TC_CIMA) ? 1 : ((t & (TC_ESQ | TC_DIR)) ? 2 : 0);
+        int tipo = olhando ? 0 : ((t & TC_CIMA) ? 1 : ((t & (TC_ESQ | TC_DIR) && !(t & TC_L)) ? 2 : 0));
         if (folego >= custo[tipo]) {
             folego -= custo[tipo];
             atq_tipo = tipo;
@@ -1197,7 +1415,7 @@ static void hud(void) {
     texto_num(2, 12, "POÇ ", pocoes, COR_BRANCO);
     if (modo == MODO_MUNDO) {
         static const char *pontos[8] = {"L", "SL", "S", "SO", "O", "NO", "N", "NL"};
-        texto(LARG - 14, 2, pontos[((wang + 16) >> 5) & 7], COR_BRANCO);
+        texto(LARG - 14, 2, pontos[((wang + cab_yaw + 16) >> 5) & 7], COR_BRANCO);
     }
     if (dano_flash) {
         dano_flash--;
@@ -1219,25 +1437,28 @@ static void redesenhar_cena(void) {
         desenhar_inimigos();
         desenhar_arma();
     } else {
-        desenhar_relevo(wpx, wpy, wang, wcamh);
+        desenhar_relevo(wpx, wpy, wang + cab_yaw, wcamh);
     }
     hud();
 }
 
 static void atualizar_mundo(u16 t, u16 n) {
     s32 c = COS(wang), s = SEN(wang), nx, ny;
-    if (t & TC_ESQ) wang -= 3;
-    if (t & TC_DIR) wang += 3;
+    int olhando = (t & TC_R) != 0;       /* R + setas controlam só a cabeça */
+    if (!olhando && !(t & TC_L)) {
+        if (t & TC_ESQ) wang -= 3;
+        if (t & TC_DIR) wang += 3;
+    }
     wang &= 255;
-    if (t & (TC_CIMA | TC_BAIXO)) {
+    if (!olhando && (t & (TC_CIMA | TC_BAIXO))) {
         int sg = (t & TC_CIMA) ? 1 : -1;
         nx = wpx + sg * c * VEL_ANDAR;
         ny = wpy + sg * s * VEL_ANDAR;
         if (!bloqueado_mundo(nx, wpy)) wpx = nx;
         if (!bloqueado_mundo(wpx, ny)) wpy = ny;
     }
-    if (t & (TC_L | TC_R)) {
-        int sg = (t & TC_R) ? 1 : -1;
+    if (!olhando && (t & TC_L) && (t & (TC_ESQ | TC_DIR))) {
+        int sg = (t & TC_DIR) ? 1 : -1;
         nx = wpx + sg * (-s) * VEL_ANDAR;
         ny = wpy + sg * c * VEL_ANDAR;
         if (!bloqueado_mundo(nx, wpy)) wpx = nx;
@@ -1306,14 +1527,19 @@ static void pagina_personagem(void) {
     texto(8, 61, mb, COR_BRANCO);
 }
 
+static int ajuda_pag;
+
 static void pagina_ajuda(void) {
-    static const char *const linhas[8] = {
-        "SETAS: ANDAR/GIRAR", "L/R: LADO A LADO", "A: AÇÃO / ATACAR", "CIMA+A: ESTOCADA",
-        "LADO+A: TALHO", "SELECT: POÇÃO", "B: SAIR (MASMORRA)", "START: MENU"};
+    static const char *const pg0[6] = {"SETAS: ANDAR/GIRAR", "L+LADOS: DE LADO", "R+SETAS: OLHAR",
+                                       "SELECT: POÇÃO", "START: MENU", ""};
+    static const char *const pg1[6] = {"A: AÇÃO / ATACAR", "CIMA+A: ESTOCADA", "LADO+A: TALHO",
+                                       "B: SAIR (MASMORRA)", "", ""};
+    const char *const *l = ajuda_pag ? pg1 : pg0;
     retangulo(0, 0, LARG, ALT_T, COR_PAINEL);
     caixa(2, 2, LARG - 4, ALT_T - 4);
-    texto_centro(3, "COMO JOGAR", COR_AMARELO);
-    for (int i = 0; i < 8; i++) texto(7, 12 + i * 8, linhas[i], COR_BRANCO);
+    texto_centro(5, ajuda_pag ? "COMBATE" : "MOVIMENTO", COR_AMARELO);
+    for (int i = 0; i < 5; i++) texto(7, 17 + i * 9, l[i], COR_BRANCO);
+    texto_centro(66, "< > TROCA PÁGINA", COR_AMARELO);
 }
 
 static void desenhar_mapa(void) {
@@ -1371,6 +1597,8 @@ static int ang_titulo;
 static void passo(u16 t, u16 n) {
     switch (estado) {
     case ST_TITULO:
+        inclina = 0;
+        cab_yaw = 0;
         ang_titulo = (ang_titulo + 1) & 255;
         janela_atualizar(wpx >> 16, wpy >> 16);
         desenhar_relevo(wpx, wpy, ang_titulo, wcamh);
@@ -1398,6 +1626,7 @@ static void passo(u16 t, u16 n) {
             break;
         }
         if (n & TC_SELECT) beber_pocao();
+        atualizar_olhar(t);
         if (modo == MODO_MUNDO) atualizar_mundo(t, n);
         else atualizar_masmorra(t, n);
         if (estado != ST_JOGO) break;
@@ -1431,7 +1660,9 @@ static void passo(u16 t, u16 n) {
         break;
     case ST_AJUDA:
         pagina_ajuda();
+        if (n & (TC_DIR | TC_ESQ | TC_CIMA | TC_BAIXO)) ajuda_pag ^= 1;
         if (n & (TC_B | TC_A)) {
+            ajuda_pag = 0;
             estado = pagina_origem;
             menu_redesenhar = 1;
         }
@@ -1502,6 +1733,8 @@ static void passo(u16 t, u16 n) {
 /* ---------------------------------------------------------- inicialização */
 static void iniciar_tabelas(void) {
     int i;
+    inv_t[0] = 0;
+    for (i = 1; i < 256; i++) inv_t[i] = 65536 / i;
     for (i = 0; i < 256; i++) sen_t[i] = (s16)lround(256.0 * sin(i * 6.283185307179586 / 256.0));
     for (i = 0; i < LARG; i++) camx_t[i] = (s16)(((2 * i - (LARG - 1)) * 256) / (LARG - 1));
 }
@@ -1634,7 +1867,8 @@ int main(void) {
     passo(0, 0);
     salvar("q_menu.raw");
     estado = ST_PERSONAGEM; passo(0, 0); salvar("q_pers.raw");
-    estado = ST_AJUDA; passo(0, 0); salvar("q_ajuda.raw");
+    estado = ST_AJUDA; ajuda_pag = 0; passo(0, 0); salvar("q_ajuda.raw");
+    ajuda_pag = 1; passo(0, 0); salvar("q_ajuda2.raw"); ajuda_pag = 0;
     modo = MODO_MUNDO; ir_para_aldeia_inicial();
     estado = ST_MAPA; mapa_pronto = 0; passo(0, 0); salvar("q_mapa.raw");
     estado = ST_MORTE; passo(0, 0); salvar("q_morte.raw");
